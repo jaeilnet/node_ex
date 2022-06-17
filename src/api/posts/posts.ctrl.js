@@ -4,7 +4,7 @@ const Joi = require('joi');
 
 const { ObjectId } = mongoose.Types;
 
-exports.checkObjectId = (ctx, next) => {
+exports.getPostbyId = async (ctx, next) => {
   const { id } = ctx.params;
 
   if (!ObjectId.isValid(id)) {
@@ -12,6 +12,30 @@ exports.checkObjectId = (ctx, next) => {
     return;
   }
 
+  try {
+    const post = await Post.findById(id);
+
+    if (!post) {
+      ctx.status = 404;
+      return;
+    }
+
+    ctx.state.post = post;
+    return next();
+  } catch (e) {
+    ctx.throw(500, e);
+  }
+
+  return next();
+};
+
+exports.checkOwnPost = (ctx, next) => {
+  const { user, post } = ctx.state;
+
+  if (post.user._id.toString() !== user._id) {
+    ctx.status = 403;
+    return;
+  }
   return next();
 };
 
@@ -32,11 +56,11 @@ exports.write = async (ctx) => {
     return;
   }
 
-  console.log(schema);
   const post = new Post({
     title,
     body,
     tags,
+    user: ctx.state.user,
   });
 
   try {
@@ -48,22 +72,52 @@ exports.write = async (ctx) => {
 };
 
 exports.list = async (ctx) => {
+  const page = parseInt(ctx.query.page || '1', 10);
+
+  // http://localhost:4000/api/posts?page=2
+
+  if (page < 1) {
+    ctx.status = 400;
+    return;
+  }
+
+  const { tag, username } = ctx.query;
+
+  const query = {
+    ...(username ? { 'user.username': username } : {}),
+    ...(tag ? { tags: tag } : {}),
+  };
+
+  console.log(query, 'query filter');
+
   try {
-    const posts = await Post.find().exec();
-    ctx.body = posts;
+    // sort({id: -1}) 역순
+    const posts = await Post.find(query)
+      .sort({ _id: -1 })
+      .limit(10)
+      .skip((page - 1) * 10)
+      .lean()
+      .exec();
+
+    const postCount = await Post.countDocuments(query).exec();
+    ctx.set('Last-Page', Math.ceil(postCount / 10));
+    ctx.body = posts
+      // .map((post) => post.toJSON())
+      .map((post) => ({
+        ...post,
+        body:
+          post.body.length < 200 ? post.body : `${post.body.slice(0, 200)}...`,
+      }));
+
+    // toJSON(); mongoose 문서는 인스턴스 객체형이니 json 형태로 바꿔야한다.
+    // 또는 lean() 함수로 처음붜 json 으로 파싱할수있다.
   } catch (error) {
     ctx.throw(500, error);
   }
 };
 
 exports.read = async (ctx) => {
-  const { id } = ctx.params;
-  try {
-    const posts = await Post.findById(id).exec();
-    ctx.body = posts;
-  } catch (error) {
-    ctx.throw(500, error);
-  }
+  ctx.body = ctx.state.post;
 };
 
 exports.remove = async (ctx) => {
@@ -79,6 +133,20 @@ exports.remove = async (ctx) => {
 
 exports.update = async (ctx) => {
   const { id } = ctx;
+
+  const schema = Joi.object().keys({
+    title: Joi.string(),
+    body: Joi.string(),
+    tags: Joi.array().items(Joi.string()),
+  });
+
+  const result = schema.validate(ctx.request.body);
+
+  if (result.error) {
+    ctx.status = 400;
+    ctx.body = result.error;
+    return;
+  }
 
   try {
     const post = await Post.findOneAndUpdate(id, ctx.request.body, {
